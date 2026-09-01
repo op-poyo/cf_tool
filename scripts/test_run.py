@@ -76,12 +76,13 @@ def main():
         .id.tolist()
     )
     total_participated = len(participated_sorted)
-    recent_participated_ids = participated_sorted[:10]
+    MAX_RECENT_CONTESTS = 20
+    recent_participated_ids = participated_sorted[:MAX_RECENT_CONTESTS]
 
     print("=" * 60)
     print(f"TOTAL LIFETIME CONTESTS PARTICIPATED IN: {total_participated}")
     print("=" * 60)
-    print(f"Recent (up to 10): {recent_participated_ids}")
+    print(f"Recent (weakness-scan window, up to {MAX_RECENT_CONTESTS}): {recent_participated_ids}")
 
     print()
     print("=" * 60)
@@ -104,9 +105,9 @@ def main():
 
     print()
     print("=" * 60)
-    print("CONTEST HISTORY -- recent participated contests")
+    print("CONTEST HISTORY -- ALL-TIME participated contests (not capped)")
     print("=" * 60)
-    print(contest_history(contests_df, problems_df, submissions_df, HANDLE, recent_participated_ids))
+    print(contest_history(contests_df, problems_df, submissions_df, HANDLE, participated_sorted))
 
     print()
     print("=" * 60)

@@ -16,6 +16,10 @@ function below re-derives its inputs from that same cached loader
 directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
 problemset on every call.
+
+STRUCTURE: three tabs -- Contests, Weaknesses, Tag Analytics -- plus the
+handle input/header which stays outside any tab since it drives the
+sync for everything below it.
 """
 
 import sys
@@ -34,7 +38,6 @@ from ingestion.client import CFClient, InvalidHandleError
 from ingestion.rate_limiter import IngestionError
 from ingestion.sync import sync_all
 from processing.derivations import SIGMOID_W_MIN, SIGMOID_W_MAX, SIGMOID_K, participated_contest_ids
-from processing.function1 import flag_weak_problems, weak_topics_summary
 from processing.function2 import suggest_virtual_contests
 from processing.function3a import solved_count_by_tag
 from processing.function3b import tag_elo_breakdown
@@ -43,6 +46,12 @@ from processing.recommendations import recommended_problems, problemset_browse_u
 from processing.contest_history import contest_history
 
 st.set_page_config(page_title="CF Analytics", layout="wide")
+
+# Fixed window for all "recent contests" weakness-scanning logic (Function 4's
+# not-done-in-contest component, Function 3B's should_have_solved category,
+# that same component in recommendations). NOT applied to the contest history
+# table, which is deliberately all-time.
+MAX_RECENT_CONTESTS = 20
 
 
 def parse_cli_args():
@@ -114,19 +123,6 @@ def _compute_participation(handle: str, sync_marker: int):
         .id.tolist()
     )
     return participated_sorted, contest_start_times, rating_changes
-
-
-@st.cache_data(show_spinner=False)
-def _compute_function1(handle: str, sync_marker: int, recent_ids: tuple):
-    contests_df, problems_df, tags_df, submissions_df, rating_hist_df, user_row = (
-        _load_dataframes_cached(handle, sync_marker)
-    )
-    handle_subs = submissions_df[submissions_df.handle == handle]
-    _, contest_start_times, rating_changes = _compute_participation(handle, sync_marker)
-    flagged = flag_weak_problems(
-        list(recent_ids), problems_df, tags_df, handle_subs, rating_changes, contest_start_times
-    )
-    return weak_topics_summary(flagged)
 
 
 @st.cache_data(show_spinner=False)
@@ -273,229 +269,169 @@ def main():
 
     st.header(f"{handle} — current rating {current_rating}")
 
-    # -- Function 1: weakness flagging -----------------------------------
-    st.subheader("Weakness flagging (recent contests)")
     participated_sorted, contest_start_times, rating_changes = _compute_participation(handle, sync_marker)
     total_participated = len(participated_sorted)
     st.caption(f"You've participated in {total_participated} contest{'s' if total_participated != 1 else ''} total.")
 
-    if total_participated == 0:
-        st.write("No contest participation found yet -- nothing to analyze.")
-        recent_ids: list[int] = []
-    else:
-        n_recent = st.slider(
-            "Number of recent contests you participated in",
-            1, total_participated, min(10, total_participated),
-        )
-        recent_ids = participated_sorted[:n_recent]
-
-        weak_summary = _compute_function1(handle, sync_marker, tuple(recent_ids))
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            if not weak_summary.empty:
-                st.plotly_chart(
-                    px.bar(weak_summary, x="tag", y="count", title="Weak topics"),
-                    use_container_width=True,
-                )
-            else:
-                st.write("No weaknesses flagged in the selected recent contests.")
-        with col2:
-            st.dataframe(weak_summary, hide_index=True, use_container_width=True)
-
-        st.markdown("**Contest history**")
-        history = _compute_contest_history(handle, sync_marker, tuple(recent_ids))
-        if not history.empty:
-            st.dataframe(
-                history.rename(
-                    columns={
-                        "contest_id": "Contest ID",
-                        "name": "Name",
-                        "date": "Date",
-                        "num_problems": "# Problems",
-                        "solved_during_contest": "Solved During",
-                        "solved_overall": "Solved Overall",
-                        "url": "Link",
-                    }
-                ),
-                hide_index=True,
-                use_container_width=True,
-                column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open")},
-            )
-        else:
-            st.write("No contest history to show.")
-
-    st.divider()
-
-    # -- Function 2: virtual contest suggestions --------------------------
-    st.subheader("Virtual contest suggestions")
-    suggestions = _compute_function2(handle, sync_marker, current_rating)
-    if not suggestions.empty:
-        display_df = suggestions.copy()
-        display_df["Date"] = pd.to_datetime(display_df["start_time"], unit="s").dt.strftime("%d %b %Y")
-        display_df["Link"] = display_df["contest_id"].apply(
-            lambda cid: f"https://codeforces.com/contest/{cid}"
-        )
-        display_df = display_df.rename(columns={"contest_id": "Contest ID", "name": "Contest"})[
-            ["Contest ID", "Contest", "Date", "Link"]
-        ]
-        st.dataframe(
-            display_df,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Link": st.column_config.LinkColumn("Link", display_text="Open"),
-            },
-        )
-    else:
-        st.write("No eligible virtual contests found.")
-
-    st.divider()
-
-    # -- Function 3A: overall solved-per-tag -------------------------------
-    st.subheader("Overall solved count per tag")
-    tag_counts = _compute_function3a(handle, sync_marker)
-    col3, col4 = st.columns([2, 1])
-    with col3:
-        if not tag_counts.empty:
-            st.plotly_chart(
-                px.bar(tag_counts, x="tag", y="count", title="Solved problems per tag"),
-                use_container_width=True,
-            )
-        else:
-            st.write("No solved problems yet.")
-    with col4:
-        st.dataframe(tag_counts, hide_index=True, use_container_width=True)
-
-    st.divider()
-
-    # -- Function 3B: elo-bucketed breakdown, one bar PER TAG per bucket --
-    st.subheader("Elo breakdown by tag")
-    selected_tags = st.multiselect("Tags", all_tags, default=all_tags[:1] if all_tags else [])
-    if selected_tags:
-        breakdown = _compute_function3b(handle, sync_marker, tuple(selected_tags), tuple(recent_ids))
-        if not breakdown.empty:
-            # Full grid of every (bucket, tag) combo actually present, sorted so buckets
-            # increase left-to-right and tags are grouped together within each bucket.
-            combos = breakdown[["bucket", "tag"]].drop_duplicates().sort_values(["bucket", "tag"])
-            pivot = breakdown.pivot_table(
-                index=["bucket", "tag"], columns="category", values="count", fill_value=0
-            ).reindex(pd.MultiIndex.from_frame(combos))
-
-            bucket_labels = [str(b) for b in combos["bucket"]]
-            tag_labels = list(combos["tag"])
-
-            fig = go.Figure()
-            colors = {
-                "first_attempt": "#1b7a1b",
-                "later_attempt": "#8fd18f",
-                "unsolved": "#d94f4f",
-                "should_have_solved": "#7a0d0d",  # dark red -- distinct from the lighter 'unsolved' red
-            }
-            labels = {
-                "first_attempt": "Solved (1st attempt)",
-                "later_attempt": "Solved (2nd+ attempt)",
-                "unsolved": "Unsolved (attempted)",
-                "should_have_solved": "Not done in contest",
-            }
-            for category in ["first_attempt", "later_attempt", "unsolved", "should_have_solved"]:
-                y_vals = pivot[category].values if category in pivot.columns else [0] * len(combos)
-                fig.add_bar(
-                    name=labels[category],
-                    x=[bucket_labels, tag_labels],  # multicategory axis: bucket groups, tag sub-labels
-                    y=y_vals,
-                    marker_color=colors[category],
-                )
-            fig.update_layout(
-                barmode="stack",
-                title="Attempts by elo bucket, one bar per tag",
-                xaxis_title="Elo bucket / tag",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("**Recommended problems for the selected tag(s)**")
-            elo_recs = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple(selected_tags))
-            _display_recommendations_table(elo_recs)
-        else:
-            st.write("Nothing to show for the selected tag(s).")
-    else:
-        st.write("Select at least one tag to see the breakdown.")
-
-    st.divider()
-
-    # -- Recommendations: independent tag filters, failed list + CF browse link
-    st.subheader("Recommended problems")
-
-    st.markdown("**Attempted + failed, or should've done in contest — easiest first**")
-    st.caption("Starts with everything. Check tags to narrow it down — matches ANY selected tag.")
-    failed_rec_tags = st.multiselect("Filter by tag(s)", all_tags, default=[], key="failed_rec_tags")
-    failed = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple(failed_rec_tags))
-    _display_recommendations_table(failed)
-
-    st.markdown("**Browse more on Codeforces**")
-    st.caption(
-        "CF's own filter uses ALL selected tags (a problem must have every one), "
-        "unlike the list above which matches ANY selected tag — different tools, different logic."
-    )
-    browse_rec_tags = st.multiselect("Filter by tag(s)", all_tags, default=[], key="browse_rec_tags")
-    rating_bounds = st.slider(
-        "Rating range",
-        min_value=800,
-        max_value=3500,
-        value=(current_rating, min(current_rating + 250, 3500)),
-        step=100,
-    )
-    browse_url = problemset_browse_url(browse_rec_tags, rating_bounds[0], rating_bounds[1])
-    st.link_button("Problemset - Codeforces", browse_url)
-
-    st.divider()
+    # Fixed window for weakness-scanning logic -- NOT used for the contest
+    # history table, which shows the user's full all-time history.
+    recent_ids = participated_sorted[:MAX_RECENT_CONTESTS]
 
     ranking, raw_counts = _compute_function4(handle, sync_marker, tuple(recent_ids), current_rating)
 
-    st.subheader("Strong / weak tags")
-    sort_mode = st.radio(
-        "Sort tags", ["Alphabetical", "Highest to lowest (total)"], horizontal=True
-    )
+    tab_contests, tab_weaknesses, tab_tags = st.tabs(["Contests", "Weaknesses", "Tag Analytics"])
 
-    def _sorted(df: pd.DataFrame, green_col: str, red_col: str) -> pd.DataFrame:
-        if df.empty:
-            return df
-        if sort_mode == "Alphabetical":
-            return df.sort_values("tag").reset_index(drop=True)
-        return df.assign(_total=df[green_col] + df[red_col]).sort_values(
-            "_total", ascending=False
-        ).drop(columns="_total").reset_index(drop=True)
+    # ======================================================================
+    # TAB 1: Contests
+    # ======================================================================
+    with tab_contests:
+        st.subheader("Contest history")
+        if total_participated == 0:
+            st.write("No contest participation found yet.")
+        else:
+            history = _compute_contest_history(handle, sync_marker, tuple(participated_sorted))
+            if not history.empty:
+                st.dataframe(
+                    history.rename(
+                        columns={
+                            "contest_id": "Contest ID",
+                            "name": "Name",
+                            "date": "Date",
+                            "num_problems": "# Problems",
+                            "solved_during_contest": "Solved During",
+                            "solved_overall": "Solved Overall",
+                            "url": "Link",
+                        }
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open")},
+                )
+            else:
+                st.write("No contest history to show.")
 
-    raw_counts = _sorted(raw_counts, "green_count", "red_count")
-    ranking = _sorted(ranking, "green_weight", "red_weight")
+        st.divider()
 
-    # -- Function 4 (raw): same solved/failed definitions, no weighting ---
-    st.markdown("**Raw counts**")
-    st.caption(
-        "\"Failed\" combines: attempted anywhere (including gym) and never solved, "
-        f"plus never-attempted problems in your last {len(recent_ids)} participated contests "
-        "that were within a fair range of your rating at the time. Plain counts, no weighting."
-    )
-    if not raw_counts.empty:
-        fig4_raw = go.Figure()
-        fig4_raw.add_bar(name="Solved", x=raw_counts.tag, y=raw_counts.green_count, marker_color="#2ca02c")
-        fig4_raw.add_bar(name="Failed", x=raw_counts.tag, y=raw_counts.red_count, marker_color="#d62728")
-        fig4_raw.update_layout(barmode="stack", title="Strong / weak tags (raw problem counts)")
-        st.plotly_chart(fig4_raw, use_container_width=True)
-        st.dataframe(raw_counts, hide_index=True, use_container_width=True)
-    else:
-        st.write("Not enough data yet.")
+        st.subheader("Virtual contest suggestions")
+        suggestions = _compute_function2(handle, sync_marker, current_rating)
+        if not suggestions.empty:
+            display_df = suggestions.copy()
+            display_df["Date"] = pd.to_datetime(display_df["start_time"], unit="s").dt.strftime("%d %b %Y")
+            display_df["Link"] = display_df["contest_id"].apply(
+                lambda cid: f"https://codeforces.com/contest/{cid}"
+            )
+            display_df = display_df.rename(columns={"contest_id": "Contest ID", "name": "Contest"})[
+                ["Contest ID", "Contest", "Date", "Link"]
+            ]
+            st.dataframe(
+                display_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                },
+            )
+        else:
+            st.write("No eligible virtual contests found.")
 
-    st.divider()
-
-    # -- Function 4 (weighted): same solved/failed definitions, elo-weighted
-    st.markdown("**Weighted**")
-    st.caption("Same solved/failed problems as above, weighted by how far each problem's rating is from yours.")
-    with st.expander("How is the weighting calculated?"):
-        st.latex(
-            r"\text{weight} = w_{min} + (w_{max} - w_{min}) \cdot \frac{1}{1 + e^{\mp\, \text{diff}/k}}"
+    # ======================================================================
+    # TAB 2: Weaknesses
+    # ======================================================================
+    with tab_weaknesses:
+        st.subheader("Weak tags")
+        st.caption(
+            "Combines: attempted anywhere (including gym) and never solved, "
+            f"plus never-attempted problems in your last {len(recent_ids)} participated contests "
+            "that were within a fair range of your rating at the time."
         )
-        st.markdown(
-            f"""
+        weak_tags_df = (
+            raw_counts[raw_counts.red_count > 0][["tag", "red_count"]]
+            .sort_values("red_count", ascending=False)
+            .reset_index(drop=True)
+        )
+        colA, colB = st.columns([2, 1])
+        with colA:
+            if not weak_tags_df.empty:
+                fig_weak = px.bar(weak_tags_df, x="tag", y="red_count", title="Failed / missed problems per tag")
+                fig_weak.update_layout(xaxis_title="Tag", yaxis_title="Count")
+                st.plotly_chart(fig_weak, use_container_width=True)
+            else:
+                st.write("No weaknesses found.")
+        with colB:
+            st.dataframe(
+                weak_tags_df.rename(columns={"red_count": "Failed"}),
+                hide_index=True, use_container_width=True,
+            )
+
+        st.markdown("**Recommended problems**")
+        st.caption("Starts with everything. Check tags to narrow it down — matches ANY selected tag.")
+        failed_rec_tags = st.multiselect("Filter by tag(s)", all_tags, default=[], key="failed_rec_tags")
+        failed = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple(failed_rec_tags))
+        _display_recommendations_table(failed)
+
+    # ======================================================================
+    # TAB 3: Tag Analytics
+    # ======================================================================
+    with tab_tags:
+        st.subheader("Overall solved count per tag")
+        tag_counts = _compute_function3a(handle, sync_marker)
+        col3, col4 = st.columns([2, 1])
+        with col3:
+            if not tag_counts.empty:
+                fig3a = px.bar(tag_counts, x="tag", y="count", title="Solved problems per tag")
+                fig3a.update_layout(xaxis_title="Tag", yaxis_title="Count")
+                st.plotly_chart(fig3a, use_container_width=True)
+            else:
+                st.write("No solved problems yet.")
+        with col4:
+            st.dataframe(tag_counts, hide_index=True, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("Strong / weak tags")
+        sort_mode = st.radio(
+            "Sort tags", ["Alphabetical", "Highest to lowest (total)"], horizontal=True
+        )
+
+        def _sorted(df: pd.DataFrame, green_col: str, red_col: str) -> pd.DataFrame:
+            if df.empty:
+                return df
+            if sort_mode == "Alphabetical":
+                return df.sort_values("tag").reset_index(drop=True)
+            return df.assign(_total=df[green_col] + df[red_col]).sort_values(
+                "_total", ascending=False
+            ).drop(columns="_total").reset_index(drop=True)
+
+        raw_counts_sorted = _sorted(raw_counts, "green_count", "red_count")
+        ranking_sorted = _sorted(ranking, "green_weight", "red_weight")
+
+        st.markdown("**Raw counts**")
+        st.caption(
+            "\"Failed\" combines: attempted anywhere (including gym) and never solved, "
+            f"plus never-attempted problems in your last {len(recent_ids)} participated contests "
+            "that were within a fair range of your rating at the time. Plain counts, no weighting."
+        )
+        if not raw_counts_sorted.empty:
+            fig4_raw = go.Figure()
+            fig4_raw.add_bar(name="Solved", x=raw_counts_sorted.tag, y=raw_counts_sorted.green_count, marker_color="#2ca02c")
+            fig4_raw.add_bar(name="Failed", x=raw_counts_sorted.tag, y=raw_counts_sorted.red_count, marker_color="#d62728")
+            fig4_raw.update_layout(
+                barmode="stack", title="Strong / weak tags (raw problem counts)",
+                xaxis_title="Tag", yaxis_title="Count",
+            )
+            st.plotly_chart(fig4_raw, use_container_width=True)
+            st.dataframe(raw_counts_sorted, hide_index=True, use_container_width=True)
+        else:
+            st.write("Not enough data yet.")
+
+        st.markdown("**Weighted**")
+        st.caption("Same solved/failed problems as above, weighted by how far each problem's rating is from yours.")
+        with st.expander("How is the weighting calculated?"):
+            st.latex(
+                r"\text{weight} = w_{min} + (w_{max} - w_{min}) \cdot \frac{1}{1 + e^{\mp\, \text{diff}/k}}"
+            )
+            st.markdown(
+                f"""
 where `diff = problem_rating - your_current_rating`, and
 `w_min = {SIGMOID_W_MIN}`, `w_max = {SIGMOID_W_MAX}`, `k = {SIGMOID_K}`.
 
@@ -508,16 +444,92 @@ where `diff = problem_rating - your_current_rating`, and
 At `diff = 0` (a problem exactly at your rating), both curves give the
 same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 0.5, 2)}`.
 """
+            )
+        if not ranking_sorted.empty:
+            fig4 = go.Figure()
+            fig4.add_bar(name="Solved", x=ranking_sorted.tag, y=ranking_sorted.green_weight, marker_color="#2ca02c")
+            fig4.add_bar(name="Failed", x=ranking_sorted.tag, y=ranking_sorted.red_weight, marker_color="#d62728")
+            fig4.update_layout(
+                barmode="stack", title="Strong / weak tags (weighted, not normalized)",
+                xaxis_title="Tag", yaxis_title="Weight",
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+            st.dataframe(ranking_sorted, hide_index=True, use_container_width=True)
+        else:
+            st.write("Not enough data yet to rank tags.")
+
+        st.divider()
+
+        st.subheader("Elo breakdown by tag")
+        selected_tags = st.multiselect("Tags", all_tags, default=all_tags[:1] if all_tags else [])
+        if selected_tags:
+            breakdown = _compute_function3b(handle, sync_marker, tuple(selected_tags), tuple(recent_ids))
+            if not breakdown.empty:
+                # Full grid of every (bucket, tag) combo actually present, sorted so buckets
+                # increase left-to-right and tags are grouped together within each bucket.
+                combos = breakdown[["bucket", "tag"]].drop_duplicates().sort_values(["bucket", "tag"])
+                pivot = breakdown.pivot_table(
+                    index=["bucket", "tag"], columns="category", values="count", fill_value=0
+                ).reindex(pd.MultiIndex.from_frame(combos))
+
+                bucket_labels = [str(b) for b in combos["bucket"]]
+                tag_labels = list(combos["tag"])
+
+                fig = go.Figure()
+                colors = {
+                    "first_attempt": "#1b7a1b",
+                    "later_attempt": "#8fd18f",
+                    "unsolved": "#d94f4f",
+                    "should_have_solved": "#7a0d0d",  # dark red -- distinct from the lighter 'unsolved' red
+                }
+                labels = {
+                    "first_attempt": "Solved (1st attempt)",
+                    "later_attempt": "Solved (2nd+ attempt)",
+                    "unsolved": "Unsolved (attempted)",
+                    "should_have_solved": "Not done in contest",
+                }
+                for category in ["first_attempt", "later_attempt", "unsolved", "should_have_solved"]:
+                    y_vals = pivot[category].values if category in pivot.columns else [0] * len(combos)
+                    fig.add_bar(
+                        name=labels[category],
+                        x=[bucket_labels, tag_labels],  # multicategory axis: bucket groups, tag sub-labels
+                        y=y_vals,
+                        marker_color=colors[category],
+                    )
+                fig.update_layout(
+                    barmode="stack",
+                    title="Attempts by elo bucket, one bar per tag",
+                    xaxis_title="Elo bucket / tag",
+                    yaxis_title="Count",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("**Recommended problems for the selected tag(s)**")
+                elo_recs = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple(selected_tags))
+                _display_recommendations_table(elo_recs)
+            else:
+                st.write("Nothing to show for the selected tag(s).")
+        else:
+            st.write("Select at least one tag to see the breakdown.")
+
+        st.divider()
+
+        st.subheader("Browse more on Codeforces")
+        st.caption(
+            "CF's own filter uses ALL selected tags (a problem must have every one), "
+            "unlike the recommendation lists above which match ANY selected tag — "
+            "different tools, different logic."
         )
-    if not ranking.empty:
-        fig4 = go.Figure()
-        fig4.add_bar(name="Solved", x=ranking.tag, y=ranking.green_weight, marker_color="#2ca02c")
-        fig4.add_bar(name="Failed", x=ranking.tag, y=ranking.red_weight, marker_color="#d62728")
-        fig4.update_layout(barmode="stack", title="Strong / weak tags (weighted, not normalized)")
-        st.plotly_chart(fig4, use_container_width=True)
-        st.dataframe(ranking, hide_index=True, use_container_width=True)
-    else:
-        st.write("Not enough data yet to rank tags.")
+        browse_rec_tags = st.multiselect("Filter by tag(s)", all_tags, default=[], key="browse_rec_tags")
+        rating_bounds = st.slider(
+            "Rating range",
+            min_value=800,
+            max_value=3500,
+            value=(current_rating, min(current_rating + 250, 3500)),
+            step=100,
+        )
+        browse_url = problemset_browse_url(browse_rec_tags, rating_bounds[0], rating_bounds[1])
+        st.link_button("Problemset - Codeforces", browse_url)
 
 
 if __name__ == "__main__":
