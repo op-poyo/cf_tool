@@ -14,7 +14,26 @@ Everything runs locally. Data is pulled from the public Codeforces API and cache
 ```bash
 git clone https://github.com/op-poyo/cf_tool.git
 cd cf_tool
+```
+
+Create and activate a virtual environment, then install dependencies:
+
+```bash
+python -m venv venv
+
+# macOS / Linux
+source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
+
 pip install -r requirements.txt
+```
+
+When you're done, deactivate with:
+
+```bash
+deactivate
 ```
 
 ## Usage
