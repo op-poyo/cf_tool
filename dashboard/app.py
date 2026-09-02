@@ -26,6 +26,7 @@ sync for everything below it.
 
 import sys
 import argparse
+import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,7 +39,7 @@ import plotly.graph_objects as go
 from db.database import init_db, get_connection, get_last_refresh
 from ingestion.client import CFClient, InvalidHandleError
 from ingestion.rate_limiter import IngestionError
-from ingestion.sync import sync_all
+from ingestion.sync import sync_global_data, sync_user_data
 from processing.derivations import SIGMOID_W_MIN, SIGMOID_W_MAX, SIGMOID_K, participated_contest_ids
 from processing.function2 import suggest_virtual_contests
 from processing.function3a import solved_count_by_tag
@@ -46,6 +47,9 @@ from processing.function3b import tag_elo_breakdown
 from processing.function4 import strong_weak_tag_ranking, strong_weak_tag_counts
 from processing.recommendations import recommended_problems, problemset_browse_url
 from processing.contest_history import contest_history
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="CF Analytics", layout="wide")
 
@@ -251,7 +255,10 @@ def main():
         client = CFClient()
         try:
             with get_connection() as conn:
-                sync_all(conn, client, handle, force=(go_clicked or cli_args.refresh))
+                with st.spinner("Fetching contest list and problemset..."):
+                    sync_global_data(conn, client, force=(go_clicked or cli_args.refresh))
+                with st.spinner(f"Fetching submissions for {handle}..."):
+                    sync_user_data(conn, client, handle, force=(go_clicked or cli_args.refresh))
             st.session_state.handle = handle
             st.session_state.data_loaded = True
         except InvalidHandleError:
@@ -260,6 +267,15 @@ def main():
             st.stop()
         except IngestionError:
             st.error("Couldn't reach Codeforces, and there's no cached data for this handle yet. Try again shortly.")
+            st.session_state.data_loaded = False
+            st.stop()
+        except Exception:
+            # Catch-all for anything unexpected (DB errors, bugs, etc.) --
+            # log the real exception server-side with a full traceback, but
+            # never render it to the page: an unhandled traceback here would
+            # leak file paths and internal details to whoever's using this.
+            logger.exception("Unexpected error syncing data for handle=%r", handle)
+            st.error("Something went wrong syncing data -- try again in a moment.")
             st.session_state.data_loaded = False
             st.stop()
 
@@ -592,4 +608,16 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # st.stop() raises Streamlit's own StopException, which IS a
+        # regular Exception subclass -- a naive broad catch here would
+        # silently swallow every st.stop() call in the app (the "enter a
+        # handle" guard, the error branches, etc.), breaking their
+        # intended early-exit behavior. Let it through unchanged; only
+        # genuinely unexpected bugs get the friendly-error treatment.
+        if type(exc).__name__ == "StopException":
+            raise
+        logger.exception("Unexpected error rendering the dashboard")
+        st.error("Something went wrong -- try refreshing the page.")
