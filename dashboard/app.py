@@ -19,12 +19,13 @@ directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
 problemset on every call.
 
-STRUCTURE: three tabs -- Contests, Weaknesses, Tag Analytics -- plus the
-handle input/header which stays outside any tab since it drives the
-sync for everything below it.
+STRUCTURE: four tabs -- Summary, Contests, Weaknesses, Tag Analytics --
+plus the handle input/header which stays outside any tab since it drives
+the sync for everything below it.
 """
 
 import sys
+import re
 import argparse
 import logging
 from pathlib import Path
@@ -58,6 +59,12 @@ st.set_page_config(page_title="CF Analytics", layout="wide")
 # that same component in recommendations). NOT applied to the contest history
 # table, which is deliberately all-time.
 MAX_RECENT_CONTESTS = 20
+
+# Codeforces handles: letters, digits, underscore, hyphen, dot; 3-24 chars.
+# Client-side check only -- catches obvious typos before a network round
+# trip, doesn't replace the real InvalidHandleError path below (CF may
+# still reject a handle that matches this shape but doesn't exist).
+HANDLE_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,24}$")
 
 
 def parse_cli_args():
@@ -189,6 +196,21 @@ def _compute_function4(handle: str, sync_marker: int, recent_ids: tuple, current
 
 
 @st.cache_data(show_spinner=False)
+def _compute_total_solved(handle: str, sync_marker: int) -> int:
+    """Distinct (contest_id, problem_index) pairs the handle has an OK
+    verdict on -- a problem solved via multiple submissions, or one that
+    appears under both its main contest and a mirrored gym contest,
+    still counts once."""
+    contests_df, problems_df, tags_df, submissions_df, rating_hist_df, user_row = (
+        _load_dataframes_cached(handle, sync_marker)
+    )
+    solved = submissions_df[
+        (submissions_df.handle == handle) & (submissions_df.verdict == "OK")
+    ]
+    return int(solved[["contest_id", "problem_index"]].drop_duplicates().shape[0])
+
+
+@st.cache_data(show_spinner=False)
 def _compute_recommendations(handle: str, sync_marker: int, recent_ids: tuple, tags: tuple):
     contests_df, problems_df, tags_df, submissions_df, rating_hist_df, user_row = (
         _load_dataframes_cached(handle, sync_marker)
@@ -250,6 +272,12 @@ def main():
         if not handle:
             st.warning("Enter a Codeforces handle.")
             st.stop()
+        if not HANDLE_RE.match(handle):
+            st.warning(
+                "That doesn't look like a valid Codeforces handle -- "
+                "check the spelling and try again."
+            )
+            st.stop()
 
         init_db()
         client = CFClient()
@@ -308,7 +336,86 @@ def main():
 
     ranking, raw_counts = _compute_function4(handle, sync_marker, tuple(recent_ids), current_rating)
 
-    tab_contests, tab_weaknesses, tab_tags = st.tabs(["Contests", "Weaknesses", "Tag Analytics"])
+    tab_summary, tab_contests, tab_weaknesses, tab_tags = st.tabs(
+        ["Summary", "Contests", "Weaknesses", "Tag Analytics"]
+    )
+
+    # ======================================================================
+    # TAB 0: Summary
+    # ======================================================================
+    with tab_summary:
+        if not ranking.empty and ranking.red_weight.sum() > 0:
+            top_weak = ranking.sort_values("red_weight", ascending=False).iloc[0]
+            top_weak_failed = int(
+                raw_counts.loc[raw_counts.tag == top_weak["tag"], "red_count"].sum()
+            )
+            st.markdown(f"### Your biggest weak spot: **{top_weak['tag']}**")
+            st.caption(
+                f"Weighted score {top_weak['red_weight']:.1f} across "
+                f"{top_weak_failed} problem{'s' if top_weak_failed != 1 else ''}. "
+                "See the Tag Analytics tab to dig in."
+            )
+        else:
+            st.markdown("### No clear weak spot yet")
+            st.caption("Solve or attempt a few more problems and this will fill in.")
+
+        st.divider()
+
+        total_solved = _compute_total_solved(handle, sync_marker)
+        weak_tag_count = int((raw_counts.red_count > 0).sum()) if not raw_counts.empty else 0
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Current rating", current_rating)
+        col2.metric("Contests participated", total_participated)
+        col3.metric("Problems solved", total_solved)
+        col4.metric("Tags needing work", weak_tag_count)
+
+        st.divider()
+
+        st.markdown("**Top weak tags**")
+        if not raw_counts.empty:
+            top3 = (
+                raw_counts[raw_counts.red_count > 0]
+                .sort_values("red_count", ascending=False)
+                .head(3)
+            )
+            if not top3.empty:
+                st.dataframe(
+                    top3[["tag", "red_count"]].rename(
+                        columns={"tag": "Tag", "red_count": "Failed / missed"}
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.write("No weak tags right now -- nice work.")
+        else:
+            st.write("Not enough data yet.")
+
+        st.divider()
+
+        st.markdown("**Next virtual contest to try**")
+        summary_suggestions = _compute_function2(handle, sync_marker, current_rating)
+        if not summary_suggestions.empty:
+            top_contest = summary_suggestions.iloc[0]
+            st.write(f"{top_contest['name']} — not yet attempted.")
+            st.link_button(
+                "Open on Codeforces",
+                f"https://codeforces.com/contest/{top_contest['contest_id']}",
+            )
+        else:
+            st.write("No eligible virtual contests found.")
+
+        st.divider()
+
+        st.markdown("**Rating over time**")
+        if not rating_hist_df.empty:
+            trend_df = rating_hist_df.sort_values("rating_update_time").copy()
+            trend_df["Date"] = pd.to_datetime(trend_df["rating_update_time"], unit="s")
+            fig_trend = px.line(trend_df, x="Date", y="rating_after", markers=True)
+            fig_trend.update_layout(xaxis_title="Date", yaxis_title="Rating", height=300)
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.write("No rating history yet.")
 
     # ======================================================================
     # TAB 1: Contests
