@@ -8,10 +8,12 @@ interaction. Without caching, that means re-querying SQLite and
 recomputing every function from scratch on every slider nudge or
 checkbox click -- even ones that have nothing to do with what changed.
 The pattern used throughout: `_load_dataframes_cached` is keyed on
-(handle, sync_marker) where sync_marker is the DB's own
-`last_synced_at` for that handle -- so it only actually re-hits SQLite
-when a real sync happens, never on a UI interaction. Every other cached
-function below re-derives its inputs from that same cached loader
+(handle, sync_marker) where sync_marker combines the user's own
+last_synced_at with the two global data freshness markers (contest
+list, problemset) -- see get_cache_marker() for why the global markers
+matter separately, not just the user's own timestamp. So it only
+actually re-hits SQLite when a real sync happens, never on a UI
+interaction. Every other cached function below re-derives its inputs from that same cached loader
 (cheap, itself a cache hit) rather than taking large DataFrames
 directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
@@ -33,7 +35,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from db.database import init_db, get_connection
+from db.database import init_db, get_connection, get_last_refresh
 from ingestion.client import CFClient, InvalidHandleError
 from ingestion.rate_limiter import IngestionError
 from ingestion.sync import sync_all
@@ -89,14 +91,25 @@ def to_raw_rating_changes(rating_hist_df: pd.DataFrame) -> list[dict]:
     ]
 
 
-def get_last_synced(handle: str) -> int:
-    """Cheap, uncached lookup -- used as the cache-busting key for
-    everything else, so it must always reflect the real current value."""
+def get_cache_marker(handle: str) -> tuple:
+    """Cache-busting key for everything below -- combines the user's own
+    last_synced_at with the two GLOBAL freshness markers (contest list,
+    problemset). These matter separately: sync_user_data can return early
+    without bumping the user's own timestamp (its hourly TTL not yet
+    expired) even in a run where sync_global_data just wrote fresh
+    contest/problem data on ITS OWN daily TTL. Keying the cache on the
+    user timestamp alone meant that fresh global data could silently sit
+    unused until the user's own cache also happened to expire. Always
+    uncached -- these are cheap single-row lookups, and their whole job
+    is to catch changes, so caching them would defeat the purpose."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT last_synced_at FROM users WHERE handle = ?", (handle,)
         ).fetchone()
-    return int(row["last_synced_at"]) if row and row["last_synced_at"] is not None else 0
+        user_marker = int(row["last_synced_at"]) if row and row["last_synced_at"] is not None else 0
+        contest_marker = get_last_refresh(conn, "global:contest_list") or 0
+        problemset_marker = get_last_refresh(conn, "global:problemset") or 0
+    return (user_marker, int(contest_marker), int(problemset_marker))
 
 
 @st.cache_data(show_spinner=False)
@@ -255,7 +268,7 @@ def main():
         st.stop()
 
     handle = st.session_state.handle
-    sync_marker = get_last_synced(handle)
+    sync_marker = get_cache_marker(handle)
     contests_df, problems_df, tags_df, submissions_df, rating_hist_df, user_row = (
         _load_dataframes_cached(handle, sync_marker)
     )
@@ -359,7 +372,7 @@ def main():
                 st.write("No weaknesses found.")
         with colB:
             st.dataframe(
-                weak_tags_df.rename(columns={"red_count": "Failed"}),
+                weak_tags_df.rename(columns={"tag": "Tag", "red_count": "Failed"}),
                 hide_index=True, use_container_width=True,
             )
 
@@ -384,26 +397,61 @@ def main():
             else:
                 st.write("No solved problems yet.")
         with col4:
-            st.dataframe(tag_counts, hide_index=True, use_container_width=True)
+            st.dataframe(
+                tag_counts.rename(columns={"tag": "Tag", "count": "Count"}),
+                hide_index=True, use_container_width=True,
+            )
+
+        st.divider()
+
+        st.subheader("Overall failed / missed count per tag")
+        st.caption(
+            "\"Failed\" combines: attempted anywhere (including gym) and never solved, "
+            f"plus never-attempted problems in your last {len(recent_ids)} participated contests "
+            "that were within a fair range of your rating at the time. Every tag shown, including 0."
+        )
+        failed_counts_df = (
+            raw_counts[["tag", "red_count"]]
+            .sort_values("red_count", ascending=False)
+            .reset_index(drop=True)
+        )
+        col5, col6 = st.columns([2, 1])
+        with col5:
+            if not failed_counts_df.empty and failed_counts_df.red_count.sum() > 0:
+                fig_failed = px.bar(failed_counts_df, x="tag", y="red_count", title="Failed / missed problems per tag")
+                fig_failed.update_layout(xaxis_title="Tag", yaxis_title="Count")
+                st.plotly_chart(fig_failed, use_container_width=True)
+            else:
+                st.write("No failed/missed problems.")
+        with col6:
+            st.dataframe(
+                failed_counts_df.rename(columns={"tag": "Tag", "red_count": "Failed"}),
+                hide_index=True, use_container_width=True,
+            )
 
         st.divider()
 
         st.subheader("Strong / weak tags")
         sort_mode = st.radio(
-            "Sort tags", ["Alphabetical", "Highest to lowest (total)"], horizontal=True
+            "Sort tags", ["Alphabetical", "Highest to lowest"], horizontal=True
+        )
+        st.caption(
+            "\"Highest to lowest\" sorts the raw counts view by total (solved+failed), "
+            "and the weighted view by net (solved−failed), matching its diverging chart below."
         )
 
-        def _sorted(df: pd.DataFrame, green_col: str, red_col: str) -> pd.DataFrame:
+        def _sorted(df: pd.DataFrame, green_col: str, red_col: str, use_net: bool = False) -> pd.DataFrame:
             if df.empty:
                 return df
             if sort_mode == "Alphabetical":
                 return df.sort_values("tag").reset_index(drop=True)
-            return df.assign(_total=df[green_col] + df[red_col]).sort_values(
-                "_total", ascending=False
-            ).drop(columns="_total").reset_index(drop=True)
+            key = (df[green_col] - df[red_col]) if use_net else (df[green_col] + df[red_col])
+            return df.assign(_key=key).sort_values(
+                "_key", ascending=False
+            ).drop(columns="_key").reset_index(drop=True)
 
         raw_counts_sorted = _sorted(raw_counts, "green_count", "red_count")
-        ranking_sorted = _sorted(ranking, "green_weight", "red_weight")
+        ranking_sorted = _sorted(ranking, "green_weight", "red_weight", use_net=True)
 
         st.markdown("**Raw counts**")
         st.caption(
@@ -420,7 +468,12 @@ def main():
                 xaxis_title="Tag", yaxis_title="Count",
             )
             st.plotly_chart(fig4_raw, use_container_width=True)
-            st.dataframe(raw_counts_sorted, hide_index=True, use_container_width=True)
+            st.dataframe(
+                raw_counts_sorted.rename(
+                    columns={"tag": "Tag", "green_count": "Solved", "red_count": "Failed"}
+                ),
+                hide_index=True, use_container_width=True,
+            )
         else:
             st.write("Not enough data yet.")
 
@@ -448,13 +501,19 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
         if not ranking_sorted.empty:
             fig4 = go.Figure()
             fig4.add_bar(name="Solved", x=ranking_sorted.tag, y=ranking_sorted.green_weight, marker_color="#2ca02c")
-            fig4.add_bar(name="Failed", x=ranking_sorted.tag, y=ranking_sorted.red_weight, marker_color="#d62728")
+            fig4.add_bar(name="Failed", x=ranking_sorted.tag, y=-ranking_sorted.red_weight, marker_color="#d62728")
             fig4.update_layout(
-                barmode="stack", title="Strong / weak tags (weighted, not normalized)",
-                xaxis_title="Tag", yaxis_title="Weight",
+                barmode="relative", title="Strong / weak tags (weighted, net)",
+                xaxis_title="Tag", yaxis_title="Weight (failed shown as negative)",
             )
+            fig4.add_hline(y=0, line_color="black", line_width=1)
             st.plotly_chart(fig4, use_container_width=True)
-            st.dataframe(ranking_sorted, hide_index=True, use_container_width=True)
+            st.dataframe(
+                ranking_sorted.rename(
+                    columns={"tag": "Tag", "green_weight": "Solved (Weight)", "red_weight": "Failed (Weight)"}
+                ),
+                hide_index=True, use_container_width=True,
+            )
         else:
             st.write("Not enough data yet to rank tags.")
 
