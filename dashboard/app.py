@@ -386,6 +386,12 @@ def main():
                     hide_index=True,
                     use_container_width=True,
                 )
+                st.markdown("**Problems to try**")
+                top3_tags = tuple(top3["tag"].tolist())
+                top_weak_recs = _compute_recommendations(
+                    handle, sync_marker, tuple(recent_ids), top3_tags
+                )
+                _display_recommendations_table(top_weak_recs)
             else:
                 st.write("No weak tags right now -- nice work.")
         else:
