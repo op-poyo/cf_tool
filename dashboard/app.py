@@ -19,9 +19,9 @@ directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
 problemset on every call.
 
-STRUCTURE: four tabs -- Summary, Contests, Weaknesses, Tag Analytics --
-plus the handle input/header which stays outside any tab since it drives
-the sync for everything below it.
+STRUCTURE: five tabs -- Summary, Contests, Weaknesses, Tag Overview,
+Deep Dive -- plus the handle input/header which stays outside any tab
+since it drives the sync for everything below it.
 """
 
 import sys
@@ -65,6 +65,20 @@ MAX_RECENT_CONTESTS = 20
 # trip, doesn't replace the real InvalidHandleError path below (CF may
 # still reject a handle that matches this shape but doesn't exist).
 HANDLE_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,24}$")
+
+# Shared semantic color palette -- every chart in the app pulls from this
+# instead of mixing Plotly Express defaults with ad-hoc hex per chart, so
+# "solved" and "failed" always mean the same color no matter which tab
+# you're looking at.
+COLORS = {
+    "solved": "#2ca02c",
+    "failed": "#d62728",
+    "first_attempt": "#1b7a1b",
+    "later_attempt": "#8fd18f",
+    "unsolved": "#d94f4f",
+    "should_have_solved": "#7a0d0d",  # dark red -- distinct from the lighter 'unsolved' red
+    "rating": "#1f77b4",
+}
 
 
 def parse_cli_args():
@@ -235,7 +249,7 @@ def _display_recommendations_table(df: pd.DataFrame):
     """Shared rendering for a recommended_problems() result -- problem_id
     leftmost, no numeric index, status + link columns."""
     if df.empty:
-        st.write("No matching problems.")
+        st.write("No matching problems. Try a different tag, or check back after your next contest.")
         return
     st.dataframe(
         df[["problem_id", "name", "rating", "tags", "status", "url"]].rename(
@@ -262,6 +276,7 @@ def main():
         st.session_state.data_loaded = False
 
     st.title("Codeforces Analytics")
+    st.caption("Best viewed on a larger screen.")
 
     handle_input = st.text_input("Codeforces handle", value=st.session_state.handle or "")
     go_clicked = st.button("Load / Refresh")
@@ -336,8 +351,8 @@ def main():
 
     ranking, raw_counts = _compute_function4(handle, sync_marker, tuple(recent_ids), current_rating)
 
-    tab_summary, tab_contests, tab_weaknesses, tab_tags = st.tabs(
-        ["Summary", "Contests", "Weaknesses", "Tag Analytics"]
+    tab_summary, tab_contests, tab_weaknesses, tab_tag_overview, tab_deep_dive = st.tabs(
+        ["Summary", "Contests", "Weaknesses", "Tag Overview", "Deep Dive"]
     )
 
     # ======================================================================
@@ -353,7 +368,7 @@ def main():
             st.caption(
                 f"Weighted score {top_weak['red_weight']:.1f} across "
                 f"{top_weak_failed} problem{'s' if top_weak_failed != 1 else ''}. "
-                "See the Tag Analytics tab to dig in."
+                "See the Tag Overview tab to dig in."
             )
         else:
             st.markdown("### No clear weak spot yet")
@@ -395,7 +410,7 @@ def main():
             else:
                 st.write("No weak tags right now -- nice work.")
         else:
-            st.write("Not enough data yet.")
+            st.write("Not enough data yet -- participate in a few contests and check back.")
 
         st.divider()
 
@@ -403,13 +418,13 @@ def main():
         summary_suggestions = _compute_function2(handle, sync_marker, current_rating)
         if not summary_suggestions.empty:
             top_contest = summary_suggestions.iloc[0]
-            st.write(f"{top_contest['name']} — not yet attempted.")
+            st.write(f"Contest {top_contest['contest_id']}: {top_contest['name']} — not yet attempted.")
             st.link_button(
                 "Open on Codeforces",
                 f"https://codeforces.com/contest/{top_contest['contest_id']}",
             )
         else:
-            st.write("No eligible virtual contests found.")
+            st.write("No eligible virtual contests found. Check back after your next rated contest.")
 
         st.divider()
 
@@ -417,11 +432,14 @@ def main():
         if not rating_hist_df.empty:
             trend_df = rating_hist_df.sort_values("rating_update_time").copy()
             trend_df["Date"] = pd.to_datetime(trend_df["rating_update_time"], unit="s")
-            fig_trend = px.line(trend_df, x="Date", y="rating_after", markers=True)
+            fig_trend = px.line(
+                trend_df, x="Date", y="rating_after", markers=True,
+                color_discrete_sequence=[COLORS["rating"]],
+            )
             fig_trend.update_layout(xaxis_title="Date", yaxis_title="Rating", height=300)
             st.plotly_chart(fig_trend, use_container_width=True)
         else:
-            st.write("No rating history yet.")
+            st.write("No rating history yet -- compete in a rated contest to start building one.")
 
     # ======================================================================
     # TAB 1: Contests
@@ -429,7 +447,7 @@ def main():
     with tab_contests:
         st.subheader("Contest history")
         if total_participated == 0:
-            st.write("No contest participation found yet.")
+            st.write("No contest participation found yet. Once you compete in a rated contest, it'll show up here.")
         else:
             history = _compute_contest_history(handle, sync_marker, tuple(participated_sorted))
             if not history.empty:
@@ -450,7 +468,7 @@ def main():
                     column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open")},
                 )
             else:
-                st.write("No contest history to show.")
+                st.write("No contest history to show. Try clicking Load / Refresh to pull the latest data.")
 
         st.divider()
 
@@ -474,7 +492,7 @@ def main():
                 },
             )
         else:
-            st.write("No eligible virtual contests found.")
+            st.write("No eligible virtual contests found. Check back after your next rated contest.")
 
     # ======================================================================
     # TAB 2: Weaknesses
@@ -494,11 +512,14 @@ def main():
         colA, colB = st.columns([2, 1])
         with colA:
             if not weak_tags_df.empty:
-                fig_weak = px.bar(weak_tags_df, x="tag", y="red_count", title="Failed / missed problems per tag")
+                fig_weak = px.bar(
+                    weak_tags_df, x="tag", y="red_count", title="Failed / missed problems per tag",
+                    color_discrete_sequence=[COLORS["failed"]],
+                )
                 fig_weak.update_layout(xaxis_title="Tag", yaxis_title="Count")
                 st.plotly_chart(fig_weak, use_container_width=True)
             else:
-                st.write("No weaknesses found.")
+                st.write("No weaknesses found -- nice work. Keep competing to keep this fresh.")
         with colB:
             st.dataframe(
                 weak_tags_df.rename(columns={"tag": "Tag", "red_count": "Failed"}),
@@ -512,19 +533,22 @@ def main():
         _display_recommendations_table(failed)
 
     # ======================================================================
-    # TAB 3: Tag Analytics
+    # TAB 3: Tag Overview
     # ======================================================================
-    with tab_tags:
+    with tab_tag_overview:
         st.subheader("Overall solved count per tag")
         tag_counts = _compute_function3a(handle, sync_marker)
         col3, col4 = st.columns([2, 1])
         with col3:
             if not tag_counts.empty:
-                fig3a = px.bar(tag_counts, x="tag", y="count", title="Solved problems per tag")
+                fig3a = px.bar(
+                    tag_counts, x="tag", y="count", title="Solved problems per tag",
+                    color_discrete_sequence=[COLORS["solved"]],
+                )
                 fig3a.update_layout(xaxis_title="Tag", yaxis_title="Count")
                 st.plotly_chart(fig3a, use_container_width=True)
             else:
-                st.write("No solved problems yet.")
+                st.write("No solved problems yet. Solve a few on Codeforces, then click Load / Refresh.")
         with col4:
             st.dataframe(
                 tag_counts.rename(columns={"tag": "Tag", "count": "Count"}),
@@ -547,11 +571,14 @@ def main():
         col5, col6 = st.columns([2, 1])
         with col5:
             if not failed_counts_df.empty and failed_counts_df.red_count.sum() > 0:
-                fig_failed = px.bar(failed_counts_df, x="tag", y="red_count", title="Failed / missed problems per tag")
+                fig_failed = px.bar(
+                    failed_counts_df, x="tag", y="red_count", title="Failed / missed problems per tag",
+                    color_discrete_sequence=[COLORS["failed"]],
+                )
                 fig_failed.update_layout(xaxis_title="Tag", yaxis_title="Count")
                 st.plotly_chart(fig_failed, use_container_width=True)
             else:
-                st.write("No failed/missed problems.")
+                st.write("No failed/missed problems -- nice work.")
         with col6:
             st.dataframe(
                 failed_counts_df.rename(columns={"tag": "Tag", "red_count": "Failed"}),
@@ -590,8 +617,8 @@ def main():
         )
         if not raw_counts_sorted.empty:
             fig4_raw = go.Figure()
-            fig4_raw.add_bar(name="Solved", x=raw_counts_sorted.tag, y=raw_counts_sorted.green_count, marker_color="#2ca02c")
-            fig4_raw.add_bar(name="Failed", x=raw_counts_sorted.tag, y=raw_counts_sorted.red_count, marker_color="#d62728")
+            fig4_raw.add_bar(name="Solved", x=raw_counts_sorted.tag, y=raw_counts_sorted.green_count, marker_color=COLORS["solved"])
+            fig4_raw.add_bar(name="Failed", x=raw_counts_sorted.tag, y=raw_counts_sorted.red_count, marker_color=COLORS["failed"])
             fig4_raw.update_layout(
                 barmode="stack", title="Strong / weak tags (raw problem counts)",
                 xaxis_title="Tag", yaxis_title="Count",
@@ -604,7 +631,7 @@ def main():
                 hide_index=True, use_container_width=True,
             )
         else:
-            st.write("Not enough data yet.")
+            st.write("Not enough data yet -- participate in a few contests and check back.")
 
         st.markdown("**Weighted**")
         st.caption("Same solved/failed problems as above, weighted by how far each problem's rating is from yours.")
@@ -629,8 +656,8 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
             )
         if not ranking_sorted.empty:
             fig4 = go.Figure()
-            fig4.add_bar(name="Solved", x=ranking_sorted.tag, y=ranking_sorted.green_weight, marker_color="#2ca02c")
-            fig4.add_bar(name="Failed", x=ranking_sorted.tag, y=-ranking_sorted.red_weight, marker_color="#d62728")
+            fig4.add_bar(name="Solved", x=ranking_sorted.tag, y=ranking_sorted.green_weight, marker_color=COLORS["solved"])
+            fig4.add_bar(name="Failed", x=ranking_sorted.tag, y=-ranking_sorted.red_weight, marker_color=COLORS["failed"])
             fig4.update_layout(
                 barmode="relative", title="Strong / weak tags (weighted, net)",
                 xaxis_title="Tag", yaxis_title="Weight (failed shown as negative)",
@@ -644,11 +671,32 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
                 hide_index=True, use_container_width=True,
             )
         else:
-            st.write("Not enough data yet to rank tags.")
+            st.write("Not enough data yet to rank tags -- participate in a few contests and check back.")
 
-        st.divider()
-
+    # ======================================================================
+    # TAB 4: Deep Dive
+    # ======================================================================
+    with tab_deep_dive:
         st.subheader("Elo breakdown by tag")
+        with st.expander("What does this chart show?"):
+            st.markdown(
+                """
+Each **elo bucket** is a rating range around your own current rating --
+problems get grouped into buckets based on how far their rating is from
+yours, so you can see whether a tag trips you up specifically at your
+level or across the board.
+
+Within each bucket, one bar per selected tag is stacked into four
+categories:
+
+- **Solved (1st attempt)** -- you got it right away.
+- **Solved (2nd+ attempt)** -- you got there, but not on the first try.
+- **Unsolved (attempted)** -- you tried and didn't solve it.
+- **Not done in contest** -- it was fair game in one of your recent
+  contests (within a reasonable rating range) but you never attempted it,
+  even later.
+"""
+            )
         selected_tags = st.multiselect("Tags", all_tags, default=all_tags[:1] if all_tags else [])
         if selected_tags:
             breakdown = _compute_function3b(handle, sync_marker, tuple(selected_tags), tuple(recent_ids))
@@ -664,12 +712,6 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
                 tag_labels = list(combos["tag"])
 
                 fig = go.Figure()
-                colors = {
-                    "first_attempt": "#1b7a1b",
-                    "later_attempt": "#8fd18f",
-                    "unsolved": "#d94f4f",
-                    "should_have_solved": "#7a0d0d",  # dark red -- distinct from the lighter 'unsolved' red
-                }
                 labels = {
                     "first_attempt": "Solved (1st attempt)",
                     "later_attempt": "Solved (2nd+ attempt)",
@@ -682,7 +724,7 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
                         name=labels[category],
                         x=[bucket_labels, tag_labels],  # multicategory axis: bucket groups, tag sub-labels
                         y=y_vals,
-                        marker_color=colors[category],
+                        marker_color=COLORS[category],
                     )
                 fig.update_layout(
                     barmode="stack",
@@ -696,7 +738,7 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
                 elo_recs = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple(selected_tags))
                 _display_recommendations_table(elo_recs)
             else:
-                st.write("Nothing to show for the selected tag(s).")
+                st.write("Nothing to show for the selected tag(s). Try a different tag, or check the Tag Overview tab for ones with more activity.")
         else:
             st.write("Select at least one tag to see the breakdown.")
 
