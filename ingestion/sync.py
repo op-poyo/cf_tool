@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 GLOBAL_TTL_SECONDS = 86400   # contest list / problemset: refresh daily
 USER_TTL_SECONDS = 3600      # per-user data: refresh hourly, or force-refresh on demand
 
+# problemset.problems only refreshes on GLOBAL_TTL_SECONDS, so a contest
+# that happened within the last few days can easily predate the last
+# global sync -- until that catches up, _extract_embedded_problems() is
+# the ONLY source for that contest's problems, and it only knows about
+# problems the user actually submitted to. Left alone, an untouched
+# problem in a recent contest has no row anywhere: num_problems undercounts
+# (looks like "only the problems I attempted"), and every tag/weakness
+# function is silently blind to it too. Bounded backfill window so this
+# doesn't turn into one contest.standings call per contest in a veteran
+# user's entire history on every sync -- older contests are already
+# covered by the routine global problemset refresh by the time this runs.
+RECENT_CONTEST_BACKFILL_SECONDS = 7 * 86400
+
 
 # -- upserts ------------------------------------------------------------
 
@@ -100,6 +113,45 @@ def _extract_embedded_problems(submissions: list[dict]) -> list[dict]:
             continue
         seen[(contest_id, index)] = p
     return list(seen.values())
+
+
+def _backfill_recent_contest_problems(
+    conn: sqlite3.Connection, client: CFClient, submissions: list[dict]
+) -> None:
+    """For any contest the user just submitted to that started within
+    RECENT_CONTEST_BACKFILL_SECONDS, fetch its full problem list from
+    contest.standings and upsert it -- overwriting whatever partial set
+    _extract_embedded_problems left behind with the real, complete one.
+    A no-op for contests the global problemset sync already fully covers
+    (the upsert just rewrites the same rows)."""
+    now = int(time.time())
+    contest_ids = {
+        s.get("problem", {}).get("contestId")
+        for s in submissions
+        if s.get("problem", {}).get("contestId") is not None
+    }
+    if not contest_ids:
+        return
+
+    placeholders = ",".join("?" * len(contest_ids))
+    rows = conn.execute(
+        f"SELECT id, start_time FROM contests WHERE id IN ({placeholders})",
+        list(contest_ids),
+    ).fetchall()
+    recent_ids = [
+        r["id"] for r in rows
+        if r["start_time"] is not None
+        and now - r["start_time"] <= RECENT_CONTEST_BACKFILL_SECONDS
+    ]
+
+    for contest_id in recent_ids:
+        try:
+            problems = client.get_contest_problems(contest_id)
+            upsert_problems_and_tags(conn, problems)
+        except IngestionError as exc:
+            logger.warning(
+                "Couldn't backfill full problem list for contest %s: %s", contest_id, exc
+            )
 
 
 def upsert_user_info(conn: sqlite3.Connection, handle: str, rating: int | None) -> None:
@@ -214,6 +266,7 @@ def sync_user_data(conn: sqlite3.Connection, client: CFClient, handle: str, forc
     embedded_problems = _extract_embedded_problems(submissions)
     if embedded_problems:
         upsert_problems_and_tags(conn, embedded_problems)
+    _backfill_recent_contest_problems(conn, client, submissions)
     upsert_submissions(conn, handle, submissions)
     mark_refreshed(conn, cache_key)
 

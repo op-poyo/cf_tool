@@ -84,3 +84,19 @@ class CFClient:
     def get_problemset_problems(self) -> dict:
         """Returns {'problems': [...], 'problemStatistics': [...]}."""
         return self._get("problemset.problems")
+
+    def get_contest_problems(self, contest_id: int) -> list[dict]:
+        """Authoritative, always-immediate full problem list for ONE
+        contest -- unlike problemset.problems (a daily-cached bulk
+        endpoint that can lag behind a contest that just happened),
+        contest.standings reflects a contest's real problem set right
+        away. count=1 keeps the payload tiny; we only want result.problems,
+        not the standings rows themselves."""
+        result = self._get(
+            "contest.standings",
+            {"contestId": contest_id, "from": 1, "count": 1, "showUnofficial": "false"},
+        )
+        problems = result["problems"]
+        for p in problems:
+            p["contestId"] = contest_id  # contest.standings problems omit this; upsert needs it
+        return problems
