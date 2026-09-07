@@ -12,14 +12,24 @@ DEFAULT_DB_PATH = Path(__file__).parent.parent / "cf_data.db"
 def init_db(db_path: Path = DEFAULT_DB_PATH) -> None:
     """Create the database file and tables if they don't already exist."""
     schema_sql = SCHEMA_PATH.read_text()
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(schema_sql)
 
 
 @contextmanager
 def get_connection(db_path: Path = DEFAULT_DB_PATH):
-    """Context-managed connection with foreign keys enabled and Row access."""
-    conn = sqlite3.connect(db_path)
+    """Context-managed connection with foreign keys enabled and Row access.
+
+    timeout=30 + WAL mode: without these, two connections to the same
+    file (e.g. a Streamlit rerun overlapping a previous one) can produce
+    'database is locked' with SQLite's default 5-second wait. WAL lets
+    reads happen concurrently with a write instead of blocking on each
+    other outright. Session tracking adds meaningfully more write
+    traffic (every timer click is a write) than the read-mostly sync
+    flow this was originally tuned for, so this matters more now."""
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:

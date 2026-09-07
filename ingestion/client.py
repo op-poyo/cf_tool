@@ -90,12 +90,21 @@ class CFClient:
         contest -- unlike problemset.problems (a daily-cached bulk
         endpoint that can lag behind a contest that just happened),
         contest.standings reflects a contest's real problem set right
-        away. count=1 keeps the payload tiny; we only want result.problems,
-        not the standings rows themselves."""
-        result = self._get(
-            "contest.standings",
-            {"contestId": contest_id, "from": 1, "count": 1, "showUnofficial": "false"},
-        )
+        away.
+
+        IMPORTANT: contestId must be the ONLY parameter. CF rejects
+        contest.standings for a non-gym contest, as a non-admin, if any
+        other parameter is present (from, count, showUnofficial, etc.) --
+        "available only via anonymous GET requests with no extra
+        parameters." An earlier version of this passed from/count/
+        showUnofficial to keep the payload small, which meant every real
+        call failed (caught as an IngestionError and silently logged,
+        so the backfill this exists for never actually ran). This does
+        mean the full standings payload comes back -- one to several MB
+        for a popular round, thousands of participant rows we don't
+        want -- but there's no smaller request CF will accept here; we
+        just discard 'rows' and keep 'problems'."""
+        result = self._get("contest.standings", {"contestId": contest_id})
         problems = result["problems"]
         for p in problems:
             p["contestId"] = contest_id  # contest.standings problems omit this; upsert needs it

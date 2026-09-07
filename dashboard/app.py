@@ -19,9 +19,10 @@ directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
 problemset on every call.
 
-STRUCTURE: five tabs -- Summary, Contests, Weaknesses, Tag Overview,
-Deep Dive -- plus the handle input/header which stays outside any tab
-since it drives the sync for everything below it.
+STRUCTURE: eight tabs -- Summary, Contests, Weaknesses, Tag Overview,
+Deep Dive, Practice Session, Previous Sessions, Logged Questions --
+plus the handle input/header which stays outside any tab since it
+drives the sync for everything below it.
 """
 
 import sys
@@ -38,6 +39,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from db.database import init_db, get_connection, get_last_refresh
+from db import sessions as sessions_db
 from ingestion.client import CFClient, InvalidHandleError
 from ingestion.rate_limiter import IngestionError
 from ingestion.sync import sync_global_data, sync_user_data
@@ -247,12 +249,17 @@ def _compute_contest_history(handle: str, sync_marker: int, contest_ids: tuple):
 
 def _display_recommendations_table(df: pd.DataFrame):
     """Shared rendering for a recommended_problems() result -- problem_id
-    leftmost, no numeric index, status + link columns."""
+    leftmost, no numeric index, status + link columns. Kept as a table
+    rather than cards (unlike Logged Questions/Practice Session) since
+    this can return dozens of rows on an unfiltered Weaknesses tab --
+    cards would trade density for a consistency that isn't worth it at
+    that length. Sorted by rating so individual rows are easier to scan."""
     if df.empty:
         st.write("No matching problems. Try a different tag, or check back after your next contest.")
         return
+    display_df = df.sort_values("rating", na_position="last")
     st.dataframe(
-        df[["problem_id", "name", "rating", "tags", "status", "url"]].rename(
+        display_df[["problem_id", "name", "rating", "tags", "status", "url"]].rename(
             columns={
                 "problem_id": "ID",
                 "name": "Problem",
@@ -274,6 +281,18 @@ def main():
         st.session_state.handle = cli_args.handle
     if "data_loaded" not in st.session_state:
         st.session_state.data_loaded = False
+
+    # Consumed here, before any tab (specifically Deep Dive's tag
+    # multiselect) has rendered this run -- Streamlit raises if you set
+    # session_state for a widget's key after that widget has already been
+    # instantiated in the same script execution, and every tab's body
+    # runs every rerun regardless of which is visually active. The
+    # "View in Deep Dive" jump button (Logged Questions tab, which
+    # renders AFTER Deep Dive) can't safely set the "deep_dive_tags" key
+    # directly for this reason -- it stashes the value here instead and
+    # reruns; this block then moves it into place before Deep Dive reads it.
+    if "pending_deep_dive_tags" in st.session_state:
+        st.session_state["deep_dive_tags"] = st.session_state.pop("pending_deep_dive_tags")
 
     st.title("Codeforces Analytics")
     st.caption("Best viewed on a larger screen.")
@@ -351,8 +370,24 @@ def main():
 
     ranking, raw_counts = _compute_function4(handle, sync_marker, tuple(recent_ids), current_rating)
 
-    tab_summary, tab_contests, tab_weaknesses, tab_tag_overview, tab_deep_dive = st.tabs(
-        ["Summary", "Contests", "Weaknesses", "Tag Overview", "Deep Dive"]
+    with get_connection() as conn:
+        _active_session_banner = sessions_db.get_active_session(conn, handle)
+        if _active_session_banner is not None:
+            _banner_attempts = sessions_db.get_session_attempts(conn, int(_active_session_banner["id"]))
+    if _active_session_banner is not None:
+        _started = pd.to_datetime(_active_session_banner["started_at"], unit="s")
+        _solved_n = int((_banner_attempts["status"] == sessions_db.STATUS_SOLVED).sum()) if not _banner_attempts.empty else 0
+        _total_n = len(_banner_attempts)
+        _running = not _banner_attempts.empty and (_banner_attempts["timer_state"] == sessions_db.TIMER_RUNNING).any()
+        st.info(
+            f"Practice session running since {_started.strftime('%H:%M')} -- "
+            f"{_solved_n}/{_total_n} solved{' -- timer running' if _running else ''}. "
+            "See the Practice Session tab."
+        )
+
+    tab_summary, tab_contests, tab_weaknesses, tab_tag_overview, tab_deep_dive, tab_practice, tab_prev_sessions, tab_logged = st.tabs(
+        ["Summary", "Contests", "Weaknesses", "Tag Overview", "Deep Dive",
+         "Practice Session", "Previous Sessions", "Logged Questions"]
     )
 
     # ======================================================================
@@ -451,8 +486,12 @@ def main():
         else:
             history = _compute_contest_history(handle, sync_marker, tuple(participated_sorted))
             if not history.empty:
+                display_history = history.copy()
+                display_history["completion_pct"] = (
+                    display_history["solved_overall"] / display_history["num_problems"] * 100
+                ).clip(0, 100)
                 st.dataframe(
-                    history.rename(
+                    display_history.rename(
                         columns={
                             "contest_id": "Contest ID",
                             "name": "Name",
@@ -460,12 +499,18 @@ def main():
                             "num_problems": "# Problems",
                             "solved_during_contest": "Solved During",
                             "solved_overall": "Solved Overall",
+                            "completion_pct": "Completion",
                             "url": "Link",
                         }
                     ),
                     hide_index=True,
                     use_container_width=True,
-                    column_config={"Link": st.column_config.LinkColumn("Link", display_text="Open")},
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                        "Completion": st.column_config.ProgressColumn(
+                            "Completion", min_value=0, max_value=100, format="%.0f%%"
+                        ),
+                    },
                 )
             else:
                 st.write("No contest history to show. Try clicking Load / Refresh to pull the latest data.")
@@ -697,7 +742,9 @@ categories:
   even later.
 """
             )
-        selected_tags = st.multiselect("Tags", all_tags, default=all_tags[:1] if all_tags else [])
+        selected_tags = st.multiselect(
+            "Tags", all_tags, default=all_tags[:1] if all_tags else [], key="deep_dive_tags"
+        )
         if selected_tags:
             breakdown = _compute_function3b(handle, sync_marker, tuple(selected_tags), tuple(recent_ids))
             if not breakdown.empty:
@@ -760,6 +807,241 @@ categories:
         )
         browse_url = problemset_browse_url(browse_rec_tags, rating_bounds[0], rating_bounds[1])
         st.link_button("Problemset - Codeforces", browse_url)
+
+    # ======================================================================
+    # TAB 5: Practice Session
+    # ======================================================================
+    with tab_practice:
+        with get_connection() as conn:
+            active = sessions_db.get_active_session(conn, handle)
+
+        if active is None:
+            st.write("No active session. Start one to track problems, timing, and notes as you practice.")
+            if st.button("Start Session", type="primary"):
+                with get_connection() as conn:
+                    sessions_db.start_session(conn, handle)
+                st.rerun()
+        else:
+            session_id = int(active["id"])
+            started_dt = pd.to_datetime(active["started_at"], unit="s")
+            st.subheader(f"Active session -- started {started_dt.strftime('%Y-%m-%d %H:%M')}")
+
+            with st.expander("Add a problem to this session", expanded=True):
+                add_mode = st.radio(
+                    "Pick from",
+                    ["Weak-tag suggestions", "Virtual contest suggestions", "Enter manually"],
+                    horizontal=True,
+                    key="practice_add_mode",
+                )
+                if add_mode == "Weak-tag suggestions":
+                    weak_recs = _compute_recommendations(handle, sync_marker, tuple(recent_ids), tuple())
+                    if weak_recs.empty:
+                        st.write("No weak-tag suggestions available right now.")
+                    else:
+                        options = (weak_recs["problem_id"] + " -- " + weak_recs["name"]).tolist()
+                        choice = st.selectbox("Problem", options, key="practice_weak_choice")
+                        if st.button("Add to session", key="practice_add_weak"):
+                            row = weak_recs.iloc[options.index(choice)]
+                            with get_connection() as conn:
+                                sessions_db.add_attempt(
+                                    conn, session_id, int(row["contest_id"]), row["problem_index"]
+                                )
+                            st.rerun()
+                elif add_mode == "Virtual contest suggestions":
+                    vc = _compute_function2(handle, sync_marker, current_rating)
+                    if vc.empty:
+                        st.write("No virtual contest suggestions available right now.")
+                    else:
+                        st.caption(
+                            "Pick a suggested contest, then add its problems one at a time by index "
+                            "(e.g. A, B, C) -- we suggest the contest, not individual problems within it."
+                        )
+                        vc_options = (vc["contest_id"].astype(str) + " -- " + vc["name"]).tolist()
+                        vc_choice = st.selectbox("Contest", vc_options, key="practice_vc_choice")
+                        vc_contest_id = int(vc_choice.split(" -- ")[0])
+                        vc_index = st.text_input("Problem index (e.g. A, B, C1)", key="practice_vc_index")
+                        if st.button("Add to session", key="practice_add_vc") and vc_index.strip():
+                            with get_connection() as conn:
+                                sessions_db.add_attempt(conn, session_id, vc_contest_id, vc_index.strip().upper())
+                            st.rerun()
+                else:
+                    manual_cols = st.columns(2)
+                    manual_contest = manual_cols[0].number_input(
+                        "Contest ID", min_value=1, step=1, key="practice_manual_contest"
+                    )
+                    manual_index = manual_cols[1].text_input(
+                        "Problem index (e.g. A, B, C1)", key="practice_manual_index"
+                    )
+                    if st.button("Add to session", key="practice_add_manual") and manual_index.strip():
+                        with get_connection() as conn:
+                            sessions_db.add_attempt(
+                                conn, session_id, int(manual_contest), manual_index.strip().upper()
+                            )
+                        st.rerun()
+
+            st.divider()
+
+            with get_connection() as conn:
+                attempts_df = sessions_db.get_session_attempts(conn, session_id)
+
+            if attempts_df.empty:
+                st.write("No problems added to this session yet -- add one above.")
+            else:
+                for _, arow in attempts_df.iterrows():
+                    attempt_id = int(arow["id"])
+                    problem_label = f"{arow['contest_id']}{arow['problem_index']}"
+                    elapsed = sessions_db.elapsed_seconds(arow)
+
+                    with st.container(border=True):
+                        header_cols = st.columns([2, 2, 3])
+                        header_cols[0].markdown(f"**{problem_label}**")
+                        header_cols[0].caption(f"status: {arow['status']}")
+                        header_cols[1].write(sessions_db.format_duration(elapsed))
+                        header_cols[2].link_button(
+                            "Open on Codeforces",
+                            f"https://codeforces.com/problemset/problem/{arow['contest_id']}/{arow['problem_index']}",
+                        )
+
+                        if arow["status"] == sessions_db.STATUS_IN_PROGRESS:
+                            timer_cols = st.columns(3)
+                            if arow["timer_state"] == sessions_db.TIMER_RUNNING:
+                                if timer_cols[0].button("Pause", key=f"pause_{attempt_id}"):
+                                    with get_connection() as conn:
+                                        sessions_db.pause_timer(conn, attempt_id)
+                                    st.rerun()
+                            else:
+                                start_label = "Start" if elapsed == 0 else "Resume"
+                                if timer_cols[0].button(start_label, key=f"start_{attempt_id}"):
+                                    with get_connection() as conn:
+                                        sessions_db.start_timer(conn, attempt_id)
+                                    st.rerun()
+
+                            felt = st.selectbox(
+                                "Felt difficulty",
+                                ["", "Easier than rated", "As expected", "Harder than rated"],
+                                key=f"felt_{attempt_id}",
+                            )
+                            notes = st.text_area("Notes", key=f"notes_{attempt_id}", height=80)
+                            action_cols = st.columns(2)
+                            if action_cols[0].button("Mark solved", key=f"solved_{attempt_id}", type="primary"):
+                                with get_connection() as conn:
+                                    sessions_db.mark_solved(conn, attempt_id, felt or None, notes or None)
+                                st.rerun()
+                            if action_cols[1].button("Give up", key=f"giveup_{attempt_id}"):
+                                with get_connection() as conn:
+                                    sessions_db.mark_gave_up(conn, attempt_id, felt or None, notes or None)
+                                st.rerun()
+                        else:
+                            if arow["felt_difficulty"]:
+                                st.caption(f"Felt: {arow['felt_difficulty']}")
+                            if arow["notes"]:
+                                st.write(arow["notes"])
+
+            st.divider()
+            end_notes = st.text_area("Session notes (optional)", key="practice_end_notes")
+            if st.button("End Session"):
+                with get_connection() as conn:
+                    sessions_db.end_session(conn, session_id, notes=end_notes or None)
+                st.rerun()
+
+    # ======================================================================
+    # TAB 6: Previous Sessions
+    # ======================================================================
+    with tab_prev_sessions:
+        with get_connection() as conn:
+            history_df = sessions_db.get_session_history(conn, handle)
+
+        if history_df.empty:
+            st.write("No past sessions yet -- finish one in the Practice Session tab and it'll show up here.")
+        else:
+            for _, srow in history_df.iterrows():
+                started = pd.to_datetime(srow["started_at"], unit="s")
+                ended = pd.to_datetime(srow["ended_at"], unit="s")
+                with st.expander(f"{started.strftime('%Y-%m-%d %H:%M')}  ({ended - started})"):
+                    with get_connection() as conn:
+                        past_attempts = sessions_db.get_session_attempts(conn, int(srow["id"]))
+                    if srow["notes"]:
+                        st.write(srow["notes"])
+                    if past_attempts.empty:
+                        st.caption("No problems logged in this session.")
+                    else:
+                        display_df = past_attempts.copy()
+                        display_df["Problem"] = display_df["contest_id"].astype(str) + display_df["problem_index"]
+                        display_df["Time"] = display_df["active_seconds"].apply(sessions_db.format_duration)
+                        st.dataframe(
+                            display_df[["Problem", "status", "Time", "felt_difficulty", "notes"]].rename(
+                                columns={
+                                    "status": "Status",
+                                    "felt_difficulty": "Felt",
+                                    "notes": "Notes",
+                                }
+                            ),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+    # ======================================================================
+    # TAB 7: Logged Questions
+    # ======================================================================
+    with tab_logged:
+        with get_connection() as conn:
+            all_attempts = sessions_db.get_all_attempts(conn, handle)
+
+        if all_attempts.empty:
+            st.write("No problems logged yet -- add some in the Practice Session tab.")
+        else:
+            merged = all_attempts.merge(
+                problems_df[["contest_id", "problem_index", "rating"]],
+                on=["contest_id", "problem_index"], how="left",
+            )
+            tag_lists = (
+                tags_df.groupby(["contest_id", "problem_index"])["tag"]
+                .apply(list).reset_index().rename(columns={"tag": "tags"})
+            )
+            merged = merged.merge(tag_lists, on=["contest_id", "problem_index"], how="left")
+            merged["tags"] = merged["tags"].apply(lambda t: t if isinstance(t, list) else [])
+            merged["problem"] = merged["contest_id"].astype(str) + merged["problem_index"]
+            merged["time_taken"] = merged["active_seconds"].apply(sessions_db.format_duration)
+
+            filter_cols = st.columns([2, 1])
+            all_logged_tags = sorted({t for tl in merged["tags"] for t in tl})
+            tag_filter = filter_cols[0].multiselect("Filter by tag", all_logged_tags, key="logged_tag_filter")
+            sort_by = filter_cols[1].radio(
+                "Sort by", ["Most recent", "Rating", "Tag"], horizontal=True, key="logged_sort_by"
+            )
+
+            view = merged
+            if tag_filter:
+                view = view[view["tags"].apply(lambda tl: any(t in tl for t in tag_filter))]
+
+            if sort_by == "Rating":
+                view = view.sort_values("rating", ascending=True, na_position="last")
+            elif sort_by == "Tag":
+                view = view.assign(_first_tag=view["tags"].apply(lambda tl: tl[0] if tl else "~")).sort_values("_first_tag")
+            else:
+                view = view.sort_values("created_at", ascending=False)
+
+            if view.empty:
+                st.write("No logged problems match that tag filter.")
+            else:
+                for _, row in view.iterrows():
+                    with st.container(border=True):
+                        info_cols = st.columns([2, 1, 3, 2])
+                        info_cols[0].markdown(f"**{row['problem']}**")
+                        info_cols[0].caption(f"status: {row['status']}")
+                        info_cols[1].write(f"{int(row['rating'])}" if pd.notna(row["rating"]) else "—")
+                        info_cols[2].write(", ".join(row["tags"]) if row["tags"] else "—")
+                        info_cols[3].write(row["time_taken"])
+
+                        if row["felt_difficulty"]:
+                            st.caption(f"Felt: {row['felt_difficulty']}")
+                        if row["notes"]:
+                            st.write(row["notes"])
+
+                        if row["tags"]:
+                            if st.button("View in Deep Dive", key=f"jump_{row['id']}"):
+                                st.session_state["pending_deep_dive_tags"] = row["tags"]
+                                st.rerun()
 
 
 if __name__ == "__main__":
