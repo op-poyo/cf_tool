@@ -19,10 +19,10 @@ directly as cache-key parameters -- this keeps each cache key to small
 hashable scalars/tuples instead of forcing Streamlit to hash the full
 problemset on every call.
 
-STRUCTURE: eight tabs -- Summary, Contests, Weaknesses, Tag Overview,
-Deep Dive, Practice Session, Previous Sessions, Logged Questions --
-plus the handle input/header which stays outside any tab since it
-drives the sync for everything below it.
+STRUCTURE: nine tabs -- Summary, Contests, Weaknesses, Rank Tiers,
+Tag Overview, Deep Dive, Practice Session, Previous Sessions, Logged
+Questions -- plus the handle input/header which stays outside any tab
+since it drives the sync for everything below it.
 """
 
 import sys
@@ -49,6 +49,7 @@ from processing.function3a import solved_count_by_tag
 from processing.function3b import tag_elo_breakdown
 from processing.function4 import strong_weak_tag_ranking, strong_weak_tag_counts
 from processing.recommendations import recommended_problems, problemset_browse_url
+from processing.tag_bands import tag_counts_by_band, tier_for_rating, RANK_TIERS
 from processing.contest_history import contest_history
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -319,8 +320,22 @@ def main():
             with get_connection() as conn:
                 with st.spinner("Fetching contest list and problemset..."):
                     sync_global_data(conn, client, force=(go_clicked or cli_args.refresh))
+                backfill_progress = st.empty()
+
+                def _update_backfill_progress(done: int, total: int) -> None:
+                    if total:
+                        backfill_progress.progress(
+                            done / total,
+                            text=f"Backfilling problem lists for older contests ({done}/{total})...",
+                        )
+
                 with st.spinner(f"Fetching submissions for {handle}..."):
-                    sync_user_data(conn, client, handle, force=(go_clicked or cli_args.refresh))
+                    sync_user_data(
+                        conn, client, handle,
+                        force=(go_clicked or cli_args.refresh),
+                        backfill_progress_callback=_update_backfill_progress,
+                    )
+                backfill_progress.empty()
             st.session_state.handle = handle
             st.session_state.data_loaded = True
         except InvalidHandleError:
@@ -385,8 +400,8 @@ def main():
             "See the Practice Session tab."
         )
 
-    tab_summary, tab_contests, tab_weaknesses, tab_tag_overview, tab_deep_dive, tab_practice, tab_prev_sessions, tab_logged = st.tabs(
-        ["Summary", "Contests", "Weaknesses", "Tag Overview", "Deep Dive",
+    tab_summary, tab_contests, tab_weaknesses, tab_rank_tiers, tab_tag_overview, tab_deep_dive, tab_practice, tab_prev_sessions, tab_logged = st.tabs(
+        ["Summary", "Contests", "Weaknesses", "Rank Tiers", "Tag Overview", "Deep Dive",
          "Practice Session", "Previous Sessions", "Logged Questions"]
     )
 
@@ -578,7 +593,7 @@ def main():
         _display_recommendations_table(failed)
 
     # ======================================================================
-    # TAB 3: Tag Overview
+    # TAB 4: Tag Overview
     # ======================================================================
     with tab_tag_overview:
         st.subheader("Overall solved count per tag")
@@ -719,7 +734,60 @@ same middle weight of `{round(SIGMOID_W_MIN + (SIGMOID_W_MAX - SIGMOID_W_MIN) * 
             st.write("Not enough data yet to rank tags -- participate in a few contests and check back.")
 
     # ======================================================================
-    # TAB 4: Deep Dive
+    # TAB 3: Rank Tiers
+    # ======================================================================
+    with tab_rank_tiers:
+        current_tier = tier_for_rating(current_rating)
+        if current_tier is not None:
+            tier_range = next(
+                (f"{lo}+" if hi >= 10_000 else f"{lo}-{hi}" for name, lo, hi in RANK_TIERS if name == current_tier),
+                "",
+            )
+            st.info(f"Your current rating of {current_rating} places you in **{current_tier}** ({tier_range}).")
+        else:
+            st.write("Couldn't place your current rating into a rank tier.")
+
+        st.subheader("Common tags by rank tier")
+        st.caption(
+            "Every rated problem this app has synced, bucketed by Codeforces' official rank "
+            "tiers -- not specific to you or your rating, just a reference for which tags "
+            "dominate each tier. A problem with multiple tags counts toward each of them."
+        )
+        band_tag_counts = tag_counts_by_band(problems_df, tags_df)
+        if band_tag_counts.empty:
+            st.write("Not enough synced problem data yet -- click Load / Refresh and check back.")
+        else:
+            available_bands = [name for name, _, _ in RANK_TIERS if name in set(band_tag_counts["elo_band"])]
+            default_index = available_bands.index(current_tier) if current_tier in available_bands else 0
+            selected_band = st.selectbox(
+                "Rank tier", available_bands, index=default_index, key="tag_band_select"
+            )
+            band_top_n = st.slider("Show top N tags", min_value=3, max_value=20, value=10, key="tag_band_top_n")
+
+            band_view = (
+                band_tag_counts[band_tag_counts["elo_band"] == selected_band]
+                .head(band_top_n)
+                .reset_index(drop=True)
+            )
+            band_total = int(band_view["band_problem_count"].iloc[0])
+            band_range = band_view["rating_range"].iloc[0]
+            st.caption(f"{band_total} rated problem(s) in this tier ({band_range}).")
+
+            fig_band = px.bar(
+                band_view, x="tag", y="tag_count", title=f"Most common tags -- {selected_band}",
+                color_discrete_sequence=[COLORS["solved"]],
+            )
+            fig_band.update_layout(xaxis_title="Tag", yaxis_title="Problem count")
+            st.plotly_chart(fig_band, use_container_width=True)
+            st.dataframe(
+                band_view[["tag", "tag_count", "pct_of_band"]].rename(
+                    columns={"tag": "Tag", "tag_count": "Count", "pct_of_band": "% of tier"}
+                ),
+                hide_index=True, use_container_width=True,
+            )
+
+    # ======================================================================
+    # TAB 5: Deep Dive
     # ======================================================================
     with tab_deep_dive:
         st.subheader("Elo breakdown by tag")
@@ -809,7 +877,7 @@ categories:
         st.link_button("Problemset - Codeforces", browse_url)
 
     # ======================================================================
-    # TAB 5: Practice Session
+    # TAB 6: Practice Session
     # ======================================================================
     with tab_practice:
         with get_connection() as conn:
@@ -945,7 +1013,7 @@ categories:
                 st.rerun()
 
     # ======================================================================
-    # TAB 6: Previous Sessions
+    # TAB 7: Previous Sessions
     # ======================================================================
     with tab_prev_sessions:
         with get_connection() as conn:
@@ -981,7 +1049,7 @@ categories:
                         )
 
     # ======================================================================
-    # TAB 7: Logged Questions
+    # TAB 8: Logged Questions
     # ======================================================================
     with tab_logged:
         with get_connection() as conn:

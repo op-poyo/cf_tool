@@ -103,7 +103,10 @@ def _extract_embedded_problems(submissions: list[dict]) -> list[dict]:
 
 
 def _backfill_missing_contest_problems(
-    conn: sqlite3.Connection, client: CFClient, submissions: list[dict]
+    conn: sqlite3.Connection,
+    client: CFClient,
+    submissions: list[dict],
+    progress_callback=None,
 ) -> None:
     """For every contest the user has ever submitted to, ensure the local
     problems table has that contest's REAL, full problem list -- not just
@@ -124,16 +127,57 @@ def _backfill_missing_contest_problems(
     the user submits to it or how many future syncs happen -- a one-time
     cost per contest, ever, rather than a recurring one. This also no
     longer depends on the contests table already having this contest's
-    start_time, which the time-window version silently required."""
+    start_time, which the time-window version silently required.
+
+    CF only accepts contest.standings for a non-gym contest, as a
+    non-admin, with contestId and NO other parameters -- so each call
+    here downloads the full standings payload (every participant row),
+    not just the problems we want. Combined with the rate limiter's
+    ~1.75s floor between calls, backfilling a long submission history in
+    one go can take real minutes on a first sync -- deliberately
+    accepted here rather than capped: an earlier version capped this at
+    a fixed number of contests per sync to keep any single sync fast,
+    but that meant a large backlog only cleared a little at a time,
+    across many manual refreshes. Runs to completion in one pass instead
+    now. progress_callback(done, total), if given, lets the caller show
+    real progress during that -- essential now, not optional, given how
+    long this can run. Still ordered most-recent-contest-first (even
+    though nothing is held back anymore) so if a sync is interrupted
+    partway, whatever DID get backfilled is what the app's own weakness/
+    tag analysis actually looks at first (bounded to the most recent
+    MAX_RECENT_CONTESTS), not an arbitrary slice. Regardless, this is
+    only ever slow once per contest: everything it touches is
+    permanently marked via cache_meta, so it's never re-fetched again --
+    after this first catch-up, every future sync is back to the small,
+    fast case of just whatever's newly appeared since last time."""
     contest_ids = {
         s.get("problem", {}).get("contestId")
         for s in submissions
         if s.get("problem", {}).get("contestId") is not None
     }
-    for contest_id in contest_ids:
+    needs_backfill = [
+        cid for cid in contest_ids
+        if get_last_refresh(conn, f"contest_problems:{cid}") is None
+    ]
+
+    # Most recent submission per contest, as a recency proxy -- cheaper
+    # than joining against the contests table, and correct for the same
+    # reason: a contest we just submitted to is a contest we care about
+    # getting right first.
+    last_submitted_at: dict[int, int] = {}
+    for s in submissions:
+        cid = s.get("problem", {}).get("contestId")
+        t = s.get("creationTimeSeconds")
+        if cid is None or t is None:
+            continue
+        if cid not in last_submitted_at or t > last_submitted_at[cid]:
+            last_submitted_at[cid] = t
+
+    to_backfill = sorted(needs_backfill, key=lambda cid: last_submitted_at.get(cid, 0), reverse=True)
+
+    total = len(to_backfill)
+    for i, contest_id in enumerate(to_backfill, start=1):
         cache_key = f"contest_problems:{contest_id}"
-        if get_last_refresh(conn, cache_key) is not None:
-            continue  # already backfilled this one, once and for all
         try:
             problems = client.get_contest_problems(contest_id)
             upsert_problems_and_tags(conn, problems)
@@ -142,6 +186,8 @@ def _backfill_missing_contest_problems(
             logger.warning(
                 "Couldn't backfill full problem list for contest %s: %s", contest_id, exc
             )
+        if progress_callback is not None:
+            progress_callback(i, total)
 
 
 def upsert_user_info(conn: sqlite3.Connection, handle: str, rating: int | None) -> None:
@@ -224,7 +270,13 @@ def sync_global_data(conn: sqlite3.Connection, client: CFClient, force: bool = F
             logger.warning("Couldn't refresh problemset, keeping cached data: %s", exc)
 
 
-def sync_user_data(conn: sqlite3.Connection, client: CFClient, handle: str, force: bool = False) -> None:
+def sync_user_data(
+    conn: sqlite3.Connection,
+    client: CFClient,
+    handle: str,
+    force: bool = False,
+    backfill_progress_callback=None,
+) -> None:
     """Refreshes a user's data if stale.
 
     Raises InvalidHandleError if the handle doesn't exist -- the caller
@@ -256,12 +308,20 @@ def sync_user_data(conn: sqlite3.Connection, client: CFClient, handle: str, forc
     embedded_problems = _extract_embedded_problems(submissions)
     if embedded_problems:
         upsert_problems_and_tags(conn, embedded_problems)
-    _backfill_missing_contest_problems(conn, client, submissions)
+    _backfill_missing_contest_problems(
+        conn, client, submissions, progress_callback=backfill_progress_callback
+    )
     upsert_submissions(conn, handle, submissions)
     mark_refreshed(conn, cache_key)
 
 
-def sync_all(conn: sqlite3.Connection, client: CFClient, handle: str, force: bool = False) -> None:
+def sync_all(
+    conn: sqlite3.Connection,
+    client: CFClient,
+    handle: str,
+    force: bool = False,
+    backfill_progress_callback=None,
+) -> None:
     """Convenience entry point: refresh global data, then user data."""
     sync_global_data(conn, client, force=force)
-    sync_user_data(conn, client, handle, force=force)
+    sync_user_data(conn, client, handle, force=force, backfill_progress_callback=backfill_progress_callback)
